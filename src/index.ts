@@ -103,9 +103,7 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "mcp-base-conhecimento" });
 });
 
-app.listen(PORT, () => {
-  console.log(`MCP Server (SSE) listening on port ${PORT}`);
-  console.log(`  GET  ${MCP_PATH} - SSE stream (n8n HTTP Streamable)`);
-  console.log(`  POST ${MCP_PATH} - mensagens (sessionId na query)`);
-  console.log(`  GET  /health   - health check`);
+const PORT = process.env.PORT || 3000;
+app.listen(Number(PORT), "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
 });
