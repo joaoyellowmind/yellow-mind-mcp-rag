@@ -103,7 +103,6 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "mcp-base-conhecimento" });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(Number(PORT), "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
