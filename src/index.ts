@@ -9,8 +9,36 @@ const PORT = Number(process.env.PORT) || 3000;
 /** Path único para MCP: GET = SSE, POST = mensagens (n8n HTTP Streamable) */
 const MCP_PATH = "/mcp";
 
+/** Timeout padrão (ms) para derrubar conexões SSE fantasmas/inativas */
+const SSE_IDLE_TIMEOUT_MS =
+  Number(process.env.MCP_SSE_IDLE_TIMEOUT_MS) || 5 * 60 * 1000; // 5 minutos
+
+type TrackedTransport = {
+  transport: SSEServerTransport;
+  clientKey: string;
+  timeout: NodeJS.Timeout;
+};
+
 // Mapa de sessão -> transport (para rotear POST com sessionId)
-const transportsBySession = new Map<string, SSEServerTransport>();
+const transportsBySession = new Map<string, TrackedTransport>();
+// Mapa de "cliente" -> transport (para fechar conexões antigas do mesmo cliente)
+const transportsByClient = new Map<string, TrackedTransport>();
+
+function getClientKey(req: Request): string {
+  const explicitClientId =
+    (req.query.clientId as string | undefined) ||
+    (req.headers["x-client-id"] as string | undefined) ||
+    (req.headers["x-n8n-session-id"] as string | undefined);
+
+  if (explicitClientId) {
+    return String(explicitClientId);
+  }
+
+  const ip = req.ip || req.socket.remoteAddress || "unknown-ip";
+  const ua = (req.headers["user-agent"] as string | undefined) || "unknown-ua";
+
+  return `${ip}__${ua}`;
+}
 
 function createServer(): McpServer {
   const server = new McpServer(
@@ -67,6 +95,30 @@ app.use(express.json({ limit: "4mb" }));
 
 // GET: estabelece o stream SSE (n8n HTTP Streamable)
 app.get(MCP_PATH, async (req: Request, res: Response) => {
+  const clientKey = getClientKey(req);
+
+  const existing = transportsByClient.get(clientKey);
+  if (existing) {
+    console.log(
+      "[MCP SSE] Nova conexão SSE recebida; fechando conexão anterior do mesmo cliente",
+      {
+        clientKey,
+        oldSessionId: existing.transport.sessionId,
+      }
+    );
+    clearTimeout(existing.timeout);
+    try {
+      await existing.transport.close();
+    } catch (error) {
+      console.log(
+        "[MCP SSE] Erro ao fechar conexão SSE anterior",
+        String(error)
+      );
+    }
+    transportsBySession.delete(existing.transport.sessionId);
+    transportsByClient.delete(clientKey);
+  }
+
   const transport = new SSEServerTransport(MCP_PATH, res);
   const server = createServer();
 
@@ -74,23 +126,58 @@ app.get(MCP_PATH, async (req: Request, res: Response) => {
   await transport.start();
 
   const sessionId = transport.sessionId;
-  transportsBySession.set(sessionId, transport);
+  console.log("[MCP SSE] Conexão SSE aberta", {
+    sessionId,
+    clientKey,
+    ip: req.ip || req.socket.remoteAddress,
+    userAgent: req.headers["user-agent"],
+  });
+
+  const timeout = setTimeout(async () => {
+    console.log("[MCP SSE] Timeout SSE atingido, fechando conexão", {
+      sessionId,
+      clientKey,
+      timeoutMs: SSE_IDLE_TIMEOUT_MS,
+    });
+    transportsBySession.delete(sessionId);
+    transportsByClient.delete(clientKey);
+    try {
+      await transport.close();
+    } catch (error) {
+      console.log(
+        "[MCP SSE] Erro ao fechar conexão SSE por timeout",
+        String(error)
+      );
+    }
+  }, SSE_IDLE_TIMEOUT_MS);
+
+  const tracked: TrackedTransport = { transport, clientKey, timeout };
+  transportsBySession.set(sessionId, tracked);
+  transportsByClient.set(clientKey, tracked);
 
   transport.onclose = () => {
+    console.log("[MCP SSE] Conexão SSE fechada (onclose)", {
+      sessionId,
+      clientKey,
+    });
+    clearTimeout(timeout);
     transportsBySession.delete(sessionId);
+    transportsByClient.delete(clientKey);
   };
 });
 
 // POST: recebe mensagens do cliente (sessionId na query ou header)
 app.post(MCP_PATH, async (req: Request, res: Response) => {
-  const sessionId = (req.query.sessionId as string) || (req.headers["mcp-session-id"] as string);
+  const sessionId =
+    (req.query.sessionId as string) || (req.headers["mcp-session-id"] as string);
 
   if (!sessionId) {
     res.status(400).send("Missing sessionId (query or header mcp-session-id)");
     return;
   }
 
-  const transport = transportsBySession.get(sessionId);
+  const tracked = transportsBySession.get(sessionId);
+  const transport = tracked?.transport;
   if (!transport) {
     res.status(404).send("Unknown session. Connect via GET /mcp first.");
     return;
